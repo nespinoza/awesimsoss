@@ -28,7 +28,6 @@ from astropy.coordinates import SkyCoord
 from astroquery.simbad import Simbad
 import batman
 from bokeh.plotting import figure, show
-# from bokeh.models import HoverTool, LogColorMapper, LogTicker, LinearColorMapper, ColorBar, Span
 from bokeh.layouts import column
 from contextlib import closing
 from hotsoss import utils, plotting, locate_trace
@@ -64,7 +63,7 @@ def run_required(func):
     @wraps(func)
     def _run_required(*args, **kwargs):
         """Check that the 'tso' attribute is not None"""
-        if args[0].tso is None:
+        if args[0].tso_order1_ideal is None:
             print("No simulation found! Please run the 'simulate' method first.")
 
         else:
@@ -244,7 +243,7 @@ class TSO(object):
 
         # Put into 3D
         orders = np.array([order.reshape(self.dims3) for order in orders])
-        tso_ideal = self.tso_ideal.reshape(self.dims3)
+        tso_ideal = np.sum(orders, axis=0).reshape(self.dims3)
 
         # Load the reference files
         pca0_file = resource_filename('awesimsoss', 'files/niriss_pca0.fits')
@@ -318,7 +317,6 @@ class TSO(object):
         if self.subarray == 'FULL':
             self.tso[:, :, :4, :] = counts
 
-    @run_required
     def export(self, outfile, all_data=False):
         """
         Export the simulated data to a JWST pipeline ingestible FITS file
@@ -332,7 +330,7 @@ class TSO(object):
             raise ValueError("Filename must end with '_uncal.fits'")
 
         # Make a RampModel
-        data = copy(self.tso)
+        data = copy(self.tso) if self.tso is not None else np.ones((1, 1, self.nrows, self.ncols))
         mod = RampModel(data=data, groupdq=np.zeros_like(data), pixeldq=np.zeros((self.nrows, self.ncols)), err=np.zeros_like(data))
         pix = utils.subarray_specs(self.subarray)
 
@@ -870,7 +868,7 @@ class TSO(object):
             self.dims3 = (self.nints * self.ngrps, self.nrows, self.ncols)
 
             # Reset the results
-            for arr in ['tso', 'tso_ideal'] + ['tso_order{}_ideal'.format(n) for n in self.orders]:
+            for arr in ['tso'] + ['tso_order{}_ideal'.format(n) for n in self.orders]:
                 setattr(self, arr, None)
 
     def _reset_time(self):
@@ -920,8 +918,8 @@ class TSO(object):
                 response = self.frame_time/(response*q.mJy*ac.c/(wave*q.um)**2).to(self.star[1].unit)
                 flux = np.interp(wave, self.star[0].value, self.star[1].value, left=0, right=0)*self.star[1].unit*response
                 cube = mt.SOSS_psf_cube(filt=self.filter, order=order, subarray=self.subarray)*flux[:, None, None]
-                setattr(self, 'order{}_response'.format(order), response)
-                setattr(self, 'order{}_psfs'.format(order), cube)
+                setattr(self, 'order{}_response'.format(order), response.astype(np.float16))
+                setattr(self, 'order{}_psfs'.format(order), cube.astype(np.float16))
 
     @run_required
     def _select_data(self, order, noise, reshape=True):
@@ -1013,98 +1011,103 @@ class TSO(object):
         if n_jobs == -1 or n_jobs > max_cores:
             n_jobs = max_cores
 
-        # Clear previous results
-        self._reset_data()
+        # Chunk along the time axis so results can be dumped into a file and then deleted
+        max_frames = 50
+        nints_per_chunk = max_frames // self.ngrps
+        nframes_per_chunk = self.ngrps * nints_per_chunk
 
-        # Generate simulation for each order
-        for order in self.orders:
+        # Chunk the time arrays
+        time_chunks = [self.time[i:i + nframes_per_chunk] for i in range(0, len(self.time), nframes_per_chunk)]
+        inttime_chunks = [self.inttime[i:i + nframes_per_chunk] for i in range(0, len(self.inttime), nframes_per_chunk)]
+        n_chunks = len(time_chunks)
 
-            # Get the wavelength map
-            wave = self.avg_wave[order - 1]
-
-            # Get the psf cube and filter response function
-            psfs = getattr(self, 'order{}_psfs'.format(order))
-
-            # Get limb darkening coeffs and make into a list
-            ld_coeffs = self.ld_coeffs[order - 1]
-            ld_coeffs = list(map(list, ld_coeffs))
-
-            # Set the radius at the given wavelength from the transmission
-            # spectrum (Rp/R*)**2... or an array of ones
-            if self.planet is not None:
-                tdepth = np.interp(wave, self.planet[0].to(q.um).value, self.planet[1])
-            else:
-                tdepth = np.ones_like(wave)
-            tdepth[tdepth < 0] = np.nan
-            self.rp = np.sqrt(tdepth)
+        # Iterate over chunks
+        for chunk, (time_chunk, inttime_chunk) in enumerate(zip(time_chunks, inttime_chunks)):
 
             # Run multiprocessing to generate lightcurves
             if self.verbose:
-                print('Calculating order {} light curves...'.format(order))
+                print('Constructing frames for chunk {}/{}...'.format(chunk + 1, n_chunks))
                 start = time.time()
 
-            # Generate the lightcurves at each wavelength
-            pool = ThreadPool(n_jobs)
-            func = partial(mt.psf_lightcurve, time=self.time.to(q.d).value, tmodel=self.tmodel)
-            data = list(zip(psfs, ld_coeffs, self.rp))
-            lightcurves = np.asarray(pool.starmap(func, data), dtype=np.float64)
-            pool.close()
-            pool.join()
-            del pool
+            # Generate simulation for each order
+            for order in self.orders:
 
-            # Reshape to make frames
-            lightcurves = lightcurves.swapaxes(0, 1)
+                # Get the wavelength map
+                wave = self.avg_wave[order - 1]
 
-            # Multiply by the integration time to convert to [ADU]
-            lightcurves *= self.inttime[:, None, None, None].to(q.s).value
+                # Get the psf cube and filter response function
+                psfs = getattr(self, 'order{}_psfs'.format(order))
 
-            # Generate TSO frames
+                # Get limb darkening coeffs and make into a list
+                ld_coeffs = self.ld_coeffs[order - 1]
+                ld_coeffs = list(map(list, ld_coeffs))
+
+                # Set the radius at the given wavelength from the transmission
+                # spectrum (Rp/R*)**2... or an array of ones
+                if self.planet is not None:
+                    tdepth = np.interp(wave, self.planet[0].to(q.um).value, self.planet[1])
+                else:
+                    tdepth = np.ones_like(wave)
+                tdepth[tdepth < 0] = np.nan
+                self.rp = np.sqrt(tdepth)
+
+                # Generate the lightcurves at each wavelength
+                pool = ThreadPool(n_jobs)
+                func = partial(mt.psf_lightcurve, time=time_chunk.to(q.d).value, tmodel=self.tmodel)
+                data = list(zip(psfs, ld_coeffs, self.rp))
+                lightcurves = np.asarray(pool.starmap(func, data), dtype=np.float16)
+                pool.close()
+                pool.join()
+                del pool
+
+                # Reshape to make frames
+                lightcurves = lightcurves.swapaxes(0, 1)
+
+                # Multiply by the integration time to convert to [ADU]
+                lightcurves *= inttime_chunk[:, None, None, None].to(q.s).value
+
+                # Make the 2048*N lightcurves into N frames
+                pool = ThreadPool(n_jobs)
+                frames = np.asarray(pool.map(mt.make_frame, lightcurves))
+                pool.close()
+                pool.join()
+                del pool
+
+                # Add it to the individual order
+                order_name = 'tso_order{}_ideal'.format(order)
+                if getattr(self, order_name) is None:
+                    setattr(self, order_name, frames)
+                else:
+                    setattr(self, order_name, np.concatenate([getattr(self, order_name), frames]))
+
+                # Clear memory
+                del frames, lightcurves, psfs, wave
+
             if self.verbose:
-                print('Lightcurves finished:', round(time.time() - start, 3), 's')
-                print('Constructing order {} traces...'.format(order))
-                start = time.time()
-
-            # Make the 2048*N lightcurves into N frames
-            pool = ThreadPool(n_jobs)
-            frames = np.asarray(pool.map(mt.make_frame, lightcurves))
-            pool.close()
-            pool.join()
-            del pool
-
-            if self.verbose:
-                # print('Total flux after warp:', np.nansum(all_frames[0]))
-                print('Order {} traces finished:'.format(order), round(time.time() - start, 3), 's')
-
-            # Add it to the individual order
-            setattr(self, 'tso_order{}_ideal'.format(order), frames)
-
-            # Clear memory
-            del frames, lightcurves, psfs, wave
-
-        # Add to the master TSO
-        self.tso_ideal = np.sum([getattr(self, 'tso_order{}_ideal'.format(order)) for order in self.orders], axis=0)
-        self.tso = self.tso_ideal.copy()
+                print('Chunk {}/{} finished:'.format(chunk + 1, n_chunks), round(time.time() - start, 3), 's')
 
         # Trim SUBSTRIP256 array if SUBSTRIP96
         if self.subarray == 'SUBSTRIP96':
-            for arr in ['tso', 'tso_ideal'] + ['tso_order{}_ideal'.format(n) for n in self.orders]:
-                setattr(self, arr, getattr(self, arr)[:, :self.nrows, :])
+            for order in self.orders:
+                order_name = 'tso_order{}_ideal'.format(order)
+                setattr(self, order_name, getattr(self, order_name)[:, :96, :])
 
         # Expand SUBSTRIP256 array if FULL frame
         if self.subarray == 'FULL':
-            for arr in ['tso', 'tso_ideal'] + ['tso_order{}_ideal'.format(n) for n in self.orders]:
-                full = np.zeros(self.dims3)
-                full[:, -256:, :] = getattr(self, arr)
-                setattr(self, arr, full)
+            for order in self.orders:
+                order_name = 'tso_order{}_ideal'.format(order)
+                full = np.zeros((self.nframes, 2048, 2048))
+                full[:, -256:, :] = getattr(self, order_name)
+                setattr(self, order_name, full)
                 del full
 
         # Reshape into (nints, ngrps, y, x)
-        for arr in ['tso', 'tso_ideal'] + ['tso_order{}_ideal'.format(n) for n in self.orders]:
-            setattr(self, arr, getattr(self, arr).reshape(self.dims))
-        # Make ramps and add noise to the observations using Kevin Volk's
-        # dark ramp simulator
-        if noise:
-            self.add_noise()
+        for order in self.orders:
+            order_name = 'tso_order{}_ideal'.format(order)
+            setattr(self, order_name, getattr(self, order_name).reshape(self.dims).astype(np.float64))
+
+        # Make ramps and add noise to the observations
+        self.add_noise()
 
         # Simulate reference pixels
         self.add_refpix()
@@ -1315,6 +1318,18 @@ class TSO(object):
             # Update ld_coeffs if necessary
             if new_params != old_params:
                 self.ld_coeffs = 'update'
+
+    @property
+    def tso_ideal(self):
+        """Getter for TSO data without noise"""
+        if self.tso is None:
+            return None
+
+        elif 2 in self.orders:
+            return np.sum([self.tso_order1_ideal, self.tso_order2_ideal], axis=0)
+
+        else:
+            return self.tso_order1_ideal
 
 
 class TestTSO(TSO):
