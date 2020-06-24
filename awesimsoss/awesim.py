@@ -960,8 +960,9 @@ class TSO(object):
 
         Parameters
         ----------
-        ld_coeffs: array-like (optional)
-            A 3D array that assigns limb darkening coefficients to each pixel, i.e. wavelength
+        ld_coeffs: array-like or list (optional)
+            If list, a 3D array that assigns limb darkening coefficients to each pixel, i.e. wavelength. If list, a 3-element list, each of which 
+            containing wavelengths, and limb-darkening coefficients.
         ld_profile: str (optional)
             The limb darkening profile to use
         noise: bool
@@ -1039,8 +1040,20 @@ class TSO(object):
                 psfs = getattr(self, 'order{}_psfs'.format(order))
 
                 # Get limb darkening coeffs and make into a list
-                ld_coeffs = self.ld_coeffs[order - 1]
-                ld_coeffs = list(map(list, ld_coeffs))
+                if type(ld_coeffs) is list:
+                    if len(ld_coeffs[order - 1]) == 0:
+                        input_ld_coeffs = self.ld_coeffs[order - 1]
+                    else:
+                        w_ld, u1_ld, u2_ld = ld_coeffs[order-1]
+                        input_ld_coeffs = np.zeros([2048,2])
+                        min_w_input = np.min(w_ld)
+                        max_w_input = np.max(w_ld)
+                        widx = np.where((wave>min_w_input) & (wave<max_w_input))[0]
+                        input_ld_coeffs[widx, 0] = np.interp(wave[widx], w_ld, u1_ld)
+                        input_ld_coeffs[widx, 1] = np.interp(wave[widx], w_ld, u2_ld)
+                else:
+                    input_ld_coeffs = self.ld_coeffs[order - 1]
+                input_ld_coeffs = list(map(list, input_ld_coeffs))
 
                 # Set the radius at the given wavelength from the transmission
                 # spectrum (Rp/R*)**2... or an array of ones
@@ -1054,7 +1067,7 @@ class TSO(object):
                 # Generate the lightcurves at each wavelength
                 pool = ThreadPool(n_jobs)
                 func = partial(mt.psf_lightcurve, time=time_chunk.to(q.d).value, tmodel=self.tmodel)
-                data = list(zip(psfs, ld_coeffs, self.rp))
+                data = list(zip(psfs, input_ld_coeffs, self.rp))
                 lightcurves = np.asarray(pool.starmap(func, data), dtype=np.float16)
                 pool.close()
                 pool.join()
