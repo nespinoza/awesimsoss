@@ -954,7 +954,7 @@ class TSO(object):
 
         return tso
 
-    def simulate(self, ld_coeffs=None, noise=True, model_grid=None, n_jobs=-1, **kwargs):
+    def simulate(self, ld_coeffs=None, noise=True, model_grid=None, n_jobs=-1, params = None, supersample_factor = None, **kwargs):
         """
         Generate the simulated 4D ramp data given the initialized TSO object
 
@@ -1024,7 +1024,14 @@ class TSO(object):
 
         # Iterate over chunks
         for chunk, (time_chunk, inttime_chunk) in enumerate(zip(time_chunks, inttime_chunks)):
-
+            # Re-define lightcurve model for the current chunk:
+            if params is not None:
+                if supersample_factor is None:
+                    c_tmodel = batman.TransitModel(params, time_chunk.to(q.d).value)
+                else:
+                    c_tmodel = batman.TransitModel(params, time_chunk.to(q.d).value, supersample_factor = supersample_factor, exp_time = self.frame_time.to(q.d).value)
+            else:
+                c_tmodel = self.tmodel
             # Run multiprocessing to generate lightcurves
             if self.verbose:
                 print('Constructing frames for chunk {}/{}...'.format(chunk + 1, n_chunks))
@@ -1066,7 +1073,7 @@ class TSO(object):
 
                 # Generate the lightcurves at each wavelength
                 pool = ThreadPool(n_jobs)
-                func = partial(mt.psf_lightcurve, time=time_chunk.to(q.d).value, tmodel=self.tmodel)
+                func = partial(mt.psf_lightcurve, time=time_chunk.to(q.d).value, tmodel=c_tmodel)
                 data = list(zip(psfs, input_ld_coeffs, self.rp))
                 lightcurves = np.asarray(pool.starmap(func, data), dtype=np.float16)
                 pool.close()
